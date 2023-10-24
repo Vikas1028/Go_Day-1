@@ -4,11 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 
 	"github.com/segmentio/kafka-go"
 	"go.elastic.co/apm"
-	"go.elastic.co/apm/module/apmhttp"
-	//"go.elastic.co/apm/stacktrace"
 )
 
 const (
@@ -18,7 +17,12 @@ const (
 
 func main() {
 	// Elastic APM initialization
-	tracer, err := apm.NewTracer("", "")
+	apmServerURL := os.Getenv("ELASTIC_APM_SERVER_URL")
+	if apmServerURL == "" {
+		log.Fatalf("ELASTIC_APM_SERVER_URL environment variable not set")
+	}
+	fmt.Println(apmServerURL)
+	tracer, err := apm.NewTracer("apm_Demo", "http://localhost:8200")
 	if err != nil {
 		log.Fatalf("Failed to create the APM tracer: %v", err)
 	}
@@ -27,11 +31,8 @@ func main() {
 	// Set up the Kafka writer
 	kafkaWriter := kafka.NewWriter(kafka.WriterConfig{
 		Brokers: []string{"localhost:9092"}, // Change to your Kafka broker address
-		Topic:   "test-topic",               // Change to your Kafka topic
+		Topic:   "apm_kafka",                // Change to your Kafka topic
 	})
-
-	// Wrap the Kafka writer with APM tracing
-	apmKafkaWriter := WrapWriter(kafkaWriter)
 
 	// Produce Kafka messages
 	ctx := context.Background()
@@ -41,58 +42,24 @@ func main() {
 			Value: []byte(fmt.Sprintf("value%d", i)),
 		}
 
-		err := apmKafkaWriter.WriteMessages(ctx, message)
+		tx := apm.DefaultTracer.StartTransaction("KafkaProducerTransaction", transactionProducerType)
+
+		span, _ := apm.StartSpan(ctx, "Produce Kafka Message", spanWriteMessageType)
+		span.Context.SetLabel("kafka_topic", kafkaWriter.Topic)
+		span.Context.SetLabel("kafka_key", string(message.Key))
+		span.Context.SetLabel("kafka_value", string(message.Value))
+
+		err := kafkaWriter.WriteMessages(ctx, message)
 		if err != nil {
-			log.Printf("Failed to produce message: %v", err)
+			apm.CaptureError(ctx, err).Send()
 		}
+
+		span.End()
+		tx.End()
 
 		fmt.Printf("Produced message %d\n", i)
 	}
 
 	// Clean up resources
-	apmKafkaWriter.W.Close()
-}
-
-// Writer is a wrapper around kafka.Writer
-type Writer struct {
-	W *kafka.Writer
-}
-
-// WrapWriter returns a new Writer wrapper around kafka.Writer
-func WrapWriter(w *kafka.Writer) *Writer {
-	return &Writer{
-		W: w,
-	}
-}
-
-// WriteMessages writes a message to Kafka
-func (w *Writer) WriteMessages(ctx context.Context, msgs ...kafka.Message) error {
-	tx := apm.TransactionFromContext(ctx)
-	if tx == nil {
-		tx = apm.DefaultTracer.StartTransaction("Produce "+w.W.Topic, transactionProducerType)
-		defer tx.End()
-	}
-	ctx = apm.ContextWithTransaction(ctx, tx)
-	for i := range msgs {
-		span, _ := apm.StartSpan(ctx, "Produce "+string(msgs[i].Key), spanWriteMessageType)
-		span.Context.SetLabel("topic", w.W.Topic)
-		span.Context.SetLabel("key", string(msgs[i].Key))
-		//span.Context.SetStacktrace(stacktrace.Callers(0))
-		traceParent := apmhttp.FormatTraceparentHeader(span.TraceContext())
-		fmt.Println("traceparent", traceParent)
-		w.addTraceparentHeader(&msgs[i], traceParent)
-		span.End()
-	}
-	err := w.W.WriteMessages(ctx, msgs...)
-	if err != nil {
-		apm.CaptureError(ctx, err).Send()
-	}
-	return err
-}
-
-func (w *Writer) addTraceparentHeader(msg *kafka.Message, traceParent string) {
-	msg.Headers = append(msg.Headers, kafka.Header{
-		Key:   "traceparent",
-		Value: []byte(traceParent),
-	})
+	kafkaWriter.Close()
 }
